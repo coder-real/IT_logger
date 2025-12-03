@@ -17,6 +17,7 @@ import { UserRole } from "../types";
 import { supabase } from "../lib/supabase";
 import AlertModal, { useAlert } from "../components/AlertModal";
 import LogPreviewModal from "../components/LogPreviewModal";
+import { LogOut } from "lucide-react";
 
 const AdminDashboard: React.FC = () => {
   const location = useLocation();
@@ -79,6 +80,23 @@ const AdminDashboard: React.FC = () => {
       showAlert("error", "Error", `Failed to fetch students: ${err.message}`);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const [loading, setLoading] = useState(true);
+  const [profile, setProfile] = useState<any>(null); // State for user profile
+
+  // Function to handle logout
+  const handleLogout = async () => {
+    try {
+      setLoading(true);
+      const { error } = await supabase.auth.signOut();
+      if (error) throw error;
+      // Logout successful, Supabase handles redirection/session cleanup
+    } catch (error) {
+      console.error("Error during logout:", (error as Error).message);
+    } finally {
+      setLoading(false);
     }
   };
 

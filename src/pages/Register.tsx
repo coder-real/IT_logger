@@ -1,4 +1,3 @@
-// src/pages/Register.tsx
 import React, { useState, useRef, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -14,23 +13,22 @@ import {
   Camera,
   RotateCcw,
   Check,
+  Wifi,
+  WifiOff,
 } from "lucide-react";
 import { supabase } from "../lib/supabase";
 import AlertModal, { useAlert } from "../components/AlertModal";
 import { getFaceEmbedding, loadModels } from "../utils/faceRecognition";
+import { esp32Camera, useESP32Camera } from "../utils/esp32Camera";
 
-// Prevent autoplay block on Chrome
-navigator.mediaDevices.getUserMedia = navigator.mediaDevices.getUserMedia;
+type CameraSource = "webcam" | "esp32";
 
 const Register: React.FC = () => {
-  // Prevent React from re-rendering video DOM and killing the stream
-  const [cameraReady, setCameraReady] = useState(false);
-  const [modelsLoaded, setModelsLoaded] = useState(false); // Track model loading status
-
   const navigate = useNavigate();
   const { alert, showAlert, closeAlert } = useAlert();
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const esp32ImgRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -38,6 +36,7 @@ const Register: React.FC = () => {
     "idle" | "uploading_photo" | "saving_db" | "complete"
   >("idle");
 
+  const [cameraSource, setCameraSource] = useState<CameraSource>("webcam");
   const [cameraMode, setCameraMode] = useState<
     "inactive" | "active" | "captured"
   >("inactive");
@@ -46,7 +45,15 @@ const Register: React.FC = () => {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [capturedEmbedding, setCapturedEmbedding] = useState<number[] | null>(
     null
-  ); // Store embedding
+  );
+
+  const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+
+  // ESP32 state
+  const [esp32IP, setEsp32IP] = useState("192.168.1.100");
+  const [showESP32Config, setShowESP32Config] = useState(false);
+  const esp32 = useESP32Camera();
 
   const [formData, setFormData] = useState({
     fullName: "",
@@ -56,9 +63,7 @@ const Register: React.FC = () => {
     email: "",
   });
 
-  // ======== INIT: LOAD MODELS & CLEANUP ========
   useEffect(() => {
-    // Load face-api models on mount
     const initModels = async () => {
       try {
         await loadModels();
@@ -80,6 +85,7 @@ const Register: React.FC = () => {
         videoRef.current.srcObject = null;
       }
       stopCamera();
+      esp32.disconnect();
     };
   }, []);
 
@@ -87,6 +93,9 @@ const Register: React.FC = () => {
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       setStream(null);
+    }
+    if (cameraSource === "esp32") {
+      esp32.stopStream();
     }
   };
 
@@ -97,7 +106,34 @@ const Register: React.FC = () => {
     setFormData((prev) => ({ ...prev, [name]: value }));
   };
 
-  // ======== START CAMERA ========
+  const connectESP32 = async () => {
+    try {
+      const connected = await esp32.connect({
+        ipAddress: esp32IP,
+        port: 80,
+        streamEndpoint: "/stream",
+        captureEndpoint: "/capture",
+      });
+
+      if (connected) {
+        showAlert("success", "Connected", "ESP32-CAM connected successfully!");
+        setShowESP32Config(false);
+      } else {
+        showAlert(
+          "error",
+          "Connection Failed",
+          "Could not connect to ESP32-CAM. Check IP address and network."
+        );
+      }
+    } catch (error) {
+      showAlert(
+        "error",
+        "Error",
+        "Failed to connect to ESP32-CAM: " + (error as Error).message
+      );
+    }
+  };
+
   const startCamera = async () => {
     if (!modelsLoaded) {
       showAlert("warning", "Please Wait", "Face models are still loading...");
@@ -105,58 +141,93 @@ const Register: React.FC = () => {
     }
 
     try {
-      stopCamera(); // cleanup old streams
+      stopCamera();
       setCapturedPhoto(null);
       setPhotoBlob(null);
       setCapturedEmbedding(null);
 
-      const media = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 640 },
-          height: { ideal: 480 },
-          facingMode: "user",
-        },
-        audio: false,
-      });
+      if (cameraSource === "webcam") {
+        const media = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            facingMode: "user",
+          },
+          audio: false,
+        });
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = media;
+        if (videoRef.current) {
+          videoRef.current.srcObject = media;
+          videoRef.current.onloadedmetadata = () => {
+            videoRef.current?.play();
+            setCameraReady(true);
+          };
+        }
 
-        // Wait until video stream actually loads
-        videoRef.current.onloadedmetadata = () => {
-          videoRef.current?.play();
+        setStream(media);
+      } else {
+        // ESP32-CAM
+        if (!esp32.status.connected) {
+          showAlert(
+            "warning",
+            "Not Connected",
+            "Please connect to ESP32-CAM first"
+          );
+          setShowESP32Config(true);
+          return;
+        }
+
+        if (esp32ImgRef.current) {
+          const started = await esp32.startStream(esp32ImgRef.current);
+          if (!started) {
+            showAlert("error", "Stream Failed", "Could not start ESP32 stream");
+            return;
+          }
           setCameraReady(true);
-        };
+        }
       }
 
-      setStream(media);
       setCameraMode("active");
     } catch (error) {
       console.error("Camera failed:", error);
-      showAlert("error", "Camera Access Denied", "Please allow webcam access.");
+      showAlert("error", "Camera Access Denied", "Please allow camera access.");
     }
   };
 
-  // ======== CAPTURE PHOTO & GENERATE EMBEDDING ========
   const capturePhoto = async () => {
-    // Webcam capture
-    if (!videoRef.current || !canvasRef.current) return;
+    if (!canvasRef.current) return;
 
-    const video = videoRef.current;
     const canvas = canvasRef.current;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-
-    // 1. Draw video frame to canvas
-    ctx.drawImage(video, 0, 0);
-
-    // 2. Generate Face Embedding from the video element directly (better accuracy)
     try {
-      // Show loading state if needed, or rely on fast processing
-      const embedding = await getFaceEmbedding(video);
+      let inputElement: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement;
+
+      if (cameraSource === "webcam") {
+        if (!videoRef.current) return;
+        inputElement = videoRef.current;
+
+        canvas.width = videoRef.current.videoWidth;
+        canvas.height = videoRef.current.videoHeight;
+
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.drawImage(videoRef.current, 0, 0);
+      } else {
+        // ESP32-CAM capture
+        const captured = await esp32.captureToCanvas(canvas);
+        if (!captured) {
+          showAlert(
+            "error",
+            "Capture Failed",
+            "Could not capture from ESP32-CAM"
+          );
+          return;
+        }
+        inputElement = canvas;
+      }
+
+      // Generate face embedding
+      const embedding = await getFaceEmbedding(inputElement);
 
       if (!embedding) {
         showAlert(
@@ -170,7 +241,7 @@ const Register: React.FC = () => {
       console.log("Face embedding generated successfully.");
       setCapturedEmbedding(embedding);
 
-      // 3. Create Blob for storage
+      // Create blob for storage
       canvas.toBlob(
         (blob) => {
           if (!blob) return;
@@ -188,7 +259,6 @@ const Register: React.FC = () => {
     }
   };
 
-  // ======== RETAKE ========
   const retakePhoto = () => {
     setCapturedPhoto(null);
     setPhotoBlob(null);
@@ -197,7 +267,6 @@ const Register: React.FC = () => {
     setCameraMode("inactive");
   };
 
-  // ======== UPLOAD TO SUPABASE STORAGE ========
   const uploadPhoto = async (blob: Blob): Promise<string | null> => {
     try {
       const fileName = `${Date.now()}-${Math.random()
@@ -224,7 +293,6 @@ const Register: React.FC = () => {
     }
   };
 
-  // ======== SUBMIT ========
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -240,12 +308,10 @@ const Register: React.FC = () => {
     setIsSubmitting(true);
 
     try {
-      // Step 1: Upload Photo
       setEnrollmentStep("uploading_photo");
       const photoUrl = await uploadPhoto(photoBlob);
       if (!photoUrl) throw new Error("Photo upload failed");
 
-      // Step 2: Create Student Record
       setEnrollmentStep("saving_db");
 
       const { data: student, error: studentError } = await supabase
@@ -266,13 +332,11 @@ const Register: React.FC = () => {
 
       if (studentError) throw studentError;
 
-      // Step 3: Save Face Embedding
-      // Note: We upsert into 'face_embeddings' linked to the new student_id
       const { error: embeddingError } = await supabase
         .from("face_embeddings")
         .insert({
           student_id: student.id,
-          embedding: capturedEmbedding, // Vector data
+          embedding: capturedEmbedding,
         });
 
       if (embeddingError)
@@ -364,46 +428,130 @@ const Register: React.FC = () => {
                   Capture Photo *
                 </h3>
 
-                {/* Camera Mode Toggle */}
+                {/* Camera Source Toggle */}
                 <div className="flex gap-2 items-center justify-center mb-4">
                   <button
                     type="button"
                     onClick={() => {
-                      setCameraMode("inactive"); // Reset
-                      // We only support webcam for this direct enrollment flow now
+                      setCameraSource("webcam");
+                      setCameraMode("inactive");
+                      stopCamera();
                     }}
-                    disabled={true} // Fixed to Webcam for now as per plan
-                    className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-all bg-green-600 text-white shadow-sm cursor-default`}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                      cameraSource === "webcam"
+                        ? "bg-green-600 text-white shadow-md"
+                        : "bg-white text-gray-700 border border-gray-300 hover:bg-gray-50"
+                    }`}
                   >
-                    💻 Webcam Enrollment
+                    💻 Webcam
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCameraSource("esp32");
+                      setCameraMode("inactive");
+                      stopCamera();
+                    }}
+                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
+                      cameraSource === "esp32"
+                        ? "bg-blue-600 text-white shadow-md"
+                        : "bg-white text-gray-700 border border-gray-300 hover:bg-gray-50"
+                    }`}
+                  >
+                    📷 ESP32-CAM
                   </button>
                 </div>
 
+                {/* ESP32 Connection Status */}
+                {cameraSource === "esp32" && (
+                  <div className="mb-4 p-3 bg-white rounded-lg border border-slate-200">
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-xs font-medium text-slate-600">
+                        ESP32 Status
+                      </span>
+                      {esp32.status.connected ? (
+                        <div className="flex items-center gap-1 text-xs text-green-600">
+                          <Wifi className="w-3 h-3" />
+                          Connected
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1 text-xs text-red-600">
+                          <WifiOff className="w-3 h-3" />
+                          Disconnected
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowESP32Config(!showESP32Config)}
+                      className="w-full text-xs text-blue-600 hover:text-blue-700 underline"
+                    >
+                      {showESP32Config ? "Hide" : "Show"} Configuration
+                    </button>
+
+                    {showESP32Config && (
+                      <div className="mt-3 space-y-2">
+                        <input
+                          type="text"
+                          value={esp32IP}
+                          onChange={(e) => setEsp32IP(e.target.value)}
+                          placeholder="192.168.1.100"
+                          className="w-full px-3 py-2 text-sm border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+                        />
+                        <button
+                          type="button"
+                          onClick={connectESP32}
+                          className="w-full px-3 py-2 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded-lg font-medium transition-colors"
+                        >
+                          Connect
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* Camera View */}
                 <div className="relative mx-auto w-64 h-64 rounded-2xl bg-slate-900 shadow-lg overflow-hidden mb-4">
-                  {/* Webcam Box */}
-                  <video
-                    ref={videoRef}
-                    autoPlay
-                    muted
-                    playsInline
-                    className={`w-full h-full object-cover transition-opacity duration-300 
-      ${cameraMode === "active" && cameraReady ? "opacity-100" : "opacity-0"}
-    `}
-                  />
+                  {/* Webcam */}
+                  {cameraSource === "webcam" && (
+                    <video
+                      ref={videoRef}
+                      autoPlay
+                      muted
+                      playsInline
+                      className={`w-full h-full object-cover transition-opacity duration-300 ${
+                        cameraMode === "active" && cameraReady
+                          ? "opacity-100"
+                          : "opacity-0"
+                      }`}
+                    />
+                  )}
 
-                  {/* Captured image */}
-                  {cameraMode === "captured" && capturedPhoto ? (
+                  {/* ESP32 Stream */}
+                  {cameraSource === "esp32" && (
+                    <img
+                      ref={esp32ImgRef}
+                      alt="ESP32 Stream"
+                      className={`w-full h-full object-cover transition-opacity duration-300 ${
+                        cameraMode === "active" && cameraReady
+                          ? "opacity-100"
+                          : "opacity-0"
+                      }`}
+                    />
+                  )}
+
+                  {/* Captured Photo */}
+                  {cameraMode === "captured" && capturedPhoto && (
                     <img
                       src={capturedPhoto}
+                      alt="Captured"
                       className="w-full h-full object-cover absolute inset-0"
                     />
-                  ) : null}
+                  )}
 
-                  {/* Hidden canvas */}
                   <canvas ref={canvasRef} className="hidden" />
 
-                  {/* Overlay when inactive */}
+                  {/* Inactive Overlay */}
                   {cameraMode === "inactive" && (
                     <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
                       <Camera className="w-16 h-16 mb-3" />
@@ -466,6 +614,7 @@ const Register: React.FC = () => {
                   )}
                 </div>
 
+                {/* Tips */}
                 <div className="mt-4 bg-blue-50 border border-blue-200 rounded-lg p-3 text-left">
                   <div className="flex items-start gap-2">
                     <AlertCircle className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
@@ -523,7 +672,7 @@ const Register: React.FC = () => {
               )}
             </div>
 
-            {/* Right: Form Inputs (Unchanged structure) */}
+            {/* Right: Form Inputs */}
             <div className="lg:col-span-2 p-8 lg:p-10 space-y-8">
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
                 <div className="sm:col-span-2">
@@ -641,7 +790,6 @@ const Register: React.FC = () => {
         </div>
       </div>
 
-      {/* Alert Modal */}
       <AlertModal
         isOpen={alert.isOpen}
         onClose={closeAlert}

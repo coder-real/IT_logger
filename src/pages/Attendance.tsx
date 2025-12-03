@@ -8,25 +8,24 @@ import {
   AlertCircle,
   RotateCcw,
   Clock,
+  LogOut as CheckOutIcon,
+  LogIn as CheckInIcon,
 } from "lucide-react";
-import { supabase } from "../lib/supabase"; // Ensure this path is correct
-import { getFaceEmbedding, loadModels } from "../utils/faceRecognition"; // Ensure this path is correct
+import { supabase } from "../lib/supabase";
+import { getFaceEmbedding, loadModels } from "../utils/faceRecognition";
 
-// Type definition for the student data returned from the RPC
 interface StudentMatch {
   student_id: string;
   full_name: string;
   similarity: number;
 }
 
-// Supabase search RPC call (must match the SQL function created in Step 3.3)
 async function findStudentByEmbedding(
   embedding: number[]
 ): Promise<StudentMatch | null> {
-  // Call the 'find_closest_student' PostgreSQL function
   const { data, error } = await supabase.rpc("find_closest_student", {
     query_embedding: embedding,
-    match_threshold: 0.85, // Adjust confidence threshold (0.0 to 1.0)
+    match_threshold: 0.85,
     match_limit: 1,
   });
 
@@ -35,7 +34,6 @@ async function findStudentByEmbedding(
     throw new Error(`Database search failed: ${error.message}`);
   }
 
-  // Returns the closest student object or null if no good match
   return data?.[0] || null;
 }
 
@@ -57,13 +55,12 @@ const Attendance: React.FC = () => {
     message: string;
   } | null>(null);
   const [todayAttendance, setTodayAttendance] = useState<any>(null);
-
-  // NEW STATE: To track if face-api.js models are ready
   const [modelsLoaded, setModelsLoaded] = useState(false);
+  const [attendanceAction, setAttendanceAction] = useState<
+    "check-in" | "check-out"
+  >("check-in");
 
-  // --- Core Logic: Authentication, Attendance Check, and Model Loading ---
   useEffect(() => {
-    // 1. Authentication Check
     const currentUser = (location.state as any)?.user;
     if (!currentUser) {
       navigate("/login");
@@ -72,16 +69,15 @@ const Attendance: React.FC = () => {
     setUser(currentUser);
     checkTodayAttendance(currentUser.id);
 
-    // 2. Load Face Models
     const loadFaceRecognitionModels = async () => {
       try {
         setResultMessage({
           type: "warning",
           message: "Loading face recognition models...",
         });
-        await loadModels(); // Calls face-api.js model loading
+        await loadModels();
         setModelsLoaded(true);
-        setResultMessage(null); // Clear message once loaded
+        setResultMessage(null);
         console.log("Face models loaded successfully.");
       } catch (error) {
         console.error("Failed to load face models:", error);
@@ -95,16 +91,12 @@ const Attendance: React.FC = () => {
 
     loadFaceRecognitionModels();
 
-    // Cleanup function: stop camera on component unmount
     return () => {
       stopCamera();
     };
   }, [location, navigate]);
 
-  // --- Helper Functions ---
-
   const checkTodayAttendance = async (studentId: string) => {
-    // Implementation kept the same: Fetches today's attendance for the user
     try {
       const today = new Date();
       const todayDate = today.toISOString().split("T")[0];
@@ -119,6 +111,13 @@ const Attendance: React.FC = () => {
       if (error) throw error;
 
       setTodayAttendance(data || null);
+
+      // Determine action based on attendance status
+      if (data) {
+        setAttendanceAction(data.check_out_time ? "check-in" : "check-out");
+      } else {
+        setAttendanceAction("check-in");
+      }
     } catch (err) {
       console.error("Error checking attendance:", err);
     }
@@ -172,7 +171,6 @@ const Attendance: React.FC = () => {
     }
   };
 
-  // --- New Core Recognition Logic (Vector Search) ---
   const captureAndRecognize = async () => {
     if (!videoRef.current || !modelsLoaded) return;
 
@@ -184,7 +182,6 @@ const Attendance: React.FC = () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
 
-      // 1. Get Face Embedding (Local Processing using face-api.js)
       const embedding = await getFaceEmbedding(video);
 
       if (!embedding) {
@@ -193,10 +190,11 @@ const Attendance: React.FC = () => {
           message:
             "No face detected. Please position your face clearly in the camera.",
         });
-        return; // Stay in active mode
+        setCameraMode("active");
+        setIsProcessing(false);
+        return;
       }
 
-      // Optional: Capture photo for UI feedback
       if (canvas) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
@@ -207,7 +205,6 @@ const Attendance: React.FC = () => {
         }
       }
 
-      // 2. Vector Similarity Search (Supabase RPC)
       const studentMatch = await findStudentByEmbedding(embedding);
 
       if (!studentMatch) {
@@ -215,48 +212,71 @@ const Attendance: React.FC = () => {
           type: "error",
           message: "Face not recognized. Please ensure you are enrolled.",
         });
-        return; // Stay in active mode
+        setCameraMode("active");
+        setIsProcessing(false);
+        return;
       }
 
-      // Found a match, now mark attendance
       const studentId = studentMatch.student_id;
       const studentName = studentMatch.full_name;
 
-      // Get current time in correct format
       const now = new Date();
       const todayDate = now.toISOString().split("T")[0];
-      const checkInTime = now.toLocaleTimeString("en-US", { hour12: false });
+      const currentTime = now.toLocaleTimeString("en-US", { hour12: false });
 
-      // 3. Mark Attendance (Direct Database Insert)
-      const { error: attendanceError } = await supabase
-        .from("attendance")
-        .insert({
-          student_id: studentId,
-          status: "PRESENT",
-          date: todayDate,
-          check_in_time: checkInTime,
-        });
-
-      if (attendanceError) {
-        // Handle unique constraint violation (student already checked in today)
-        if (attendanceError.code === "23505") {
-          setResultMessage({
-            type: "warning",
-            message: `${studentName}: Attendance already marked today.`,
+      if (attendanceAction === "check-in") {
+        // Check-In Logic
+        const { error: attendanceError } = await supabase
+          .from("attendance")
+          .insert({
+            student_id: studentId,
+            status: "PRESENT",
+            date: todayDate,
+            check_in_time: currentTime,
           });
+
+        if (attendanceError) {
+          if (attendanceError.code === "23505") {
+            setResultMessage({
+              type: "warning",
+              message: `${studentName}: Already checked in today.`,
+            });
+          } else {
+            throw new Error(
+              `Failed to save attendance: ${attendanceError.message}`
+            );
+          }
         } else {
-          throw new Error(
-            `Failed to save attendance: ${attendanceError.message}`
-          );
+          setResultMessage({
+            type: "success",
+            message: `Welcome, ${studentName}! Check-in successful at ${currentTime}.`,
+          });
+
+          await checkTodayAttendance(user.id);
+          stopCamera();
+          setCameraMode("inactive");
         }
       } else {
-        // Success
+        // Check-Out Logic
+        const { error: checkoutError } = await supabase
+          .from("attendance")
+          .update({
+            check_out_time: currentTime,
+            status: "COMPLETED",
+          })
+          .eq("student_id", studentId)
+          .eq("date", todayDate)
+          .is("check_out_time", null);
+
+        if (checkoutError) {
+          throw new Error(`Failed to check out: ${checkoutError.message}`);
+        }
+
         setResultMessage({
           type: "success",
-          message: `Welcome, ${studentName}! Attendance marked successfully.`,
+          message: `Goodbye, ${studentName}! Check-out successful at ${currentTime}.`,
         });
 
-        // Refresh attendance status and stop camera
         await checkTodayAttendance(user.id);
         stopCamera();
         setCameraMode("inactive");
@@ -265,9 +285,8 @@ const Attendance: React.FC = () => {
       console.error("Recognition/Attendance Error:", error);
       setResultMessage({
         type: "error",
-        message: `Failed to complete check-in: ${error.message}`,
+        message: `Failed to complete ${attendanceAction}: ${error.message}`,
       });
-      // Set back to active mode to allow retry
       setCameraMode("active");
     } finally {
       setIsProcessing(false);
@@ -277,7 +296,7 @@ const Attendance: React.FC = () => {
   const retryCapture = () => {
     setCapturedPhoto(null);
     setResultMessage(null);
-    setCameraMode("inactive"); // Will prompt to start camera again
+    setCameraMode("inactive");
   };
 
   if (!user) return null;
@@ -290,30 +309,53 @@ const Attendance: React.FC = () => {
           Mark Attendance
         </h2>
         <p className="mt-1 text-gray-500">
-          Use face recognition to check in for today
+          Use face recognition to{" "}
+          {attendanceAction === "check-in" ? "check in" : "check out"} for today
         </p>
       </div>
 
-      {/* Today's Status Card (No change) */}
+      {/* Attendance Status Cards */}
       {todayAttendance ? (
-        <div className="mb-8 bg-green-50 border border-green-200 rounded-2xl p-6">
-          <div className="flex items-start gap-4">
-            <div className="shrink-0 bg-green-100 rounded-xl p-3">
-              <CheckCircle className="h-6 w-6 text-green-600" />
-            </div>
-            <div className="flex-1">
-              <h3 className="text-lg font-semibold text-green-900">
-                Already Checked In Today
-              </h3>
-              <p className="text-sm text-green-700 mt-1">
-                Check-in time: {todayAttendance.check_in_time}
-              </p>
-              <p className="text-xs text-green-600 mt-2">
-                You've successfully marked your attendance for today.
-              </p>
+        todayAttendance.check_out_time ? (
+          <div className="mb-8 bg-purple-50 border border-purple-200 rounded-2xl p-6">
+            <div className="flex items-start gap-4">
+              <div className="shrink-0 bg-purple-100 rounded-xl p-3">
+                <CheckCircle className="h-6 w-6 text-purple-600" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-semibold text-purple-900">
+                  Attendance Completed for Today
+                </h3>
+                <div className="mt-2 space-y-1 text-sm text-purple-700">
+                  <p>Check-in: {todayAttendance.check_in_time}</p>
+                  <p>Check-out: {todayAttendance.check_out_time}</p>
+                </div>
+                <p className="text-xs text-purple-600 mt-2">
+                  You've completed your attendance cycle for today.
+                </p>
+              </div>
             </div>
           </div>
-        </div>
+        ) : (
+          <div className="mb-8 bg-amber-50 border border-amber-200 rounded-2xl p-6">
+            <div className="flex items-start gap-4">
+              <div className="shrink-0 bg-amber-100 rounded-xl p-3">
+                <CheckOutIcon className="h-6 w-6 text-amber-600" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg font-semibold text-amber-900">
+                  Ready to Check Out
+                </h3>
+                <p className="text-sm text-amber-700 mt-1">
+                  Check-in time: {todayAttendance.check_in_time}
+                </p>
+                <p className="text-xs text-amber-600 mt-2">
+                  Use face recognition below to mark your departure.
+                </p>
+              </div>
+            </div>
+          </div>
+        )
       ) : (
         <div className="mb-8 bg-blue-50 border border-blue-200 rounded-2xl p-6">
           <div className="flex items-start gap-4">
@@ -332,7 +374,7 @@ const Attendance: React.FC = () => {
         </div>
       )}
 
-      {/* Result Message (No change) */}
+      {/* Result Message */}
       {resultMessage && (
         <div
           className={`mb-6 rounded-2xl p-4 border ${
@@ -369,9 +411,17 @@ const Attendance: React.FC = () => {
       {/* Camera Section */}
       <div className="bg-white shadow-[0_2px_10px_rgb(0,0,0,0.03)] border border-gray-100 rounded-2xl overflow-hidden">
         <div className="p-8 flex flex-col items-center">
-          <h3 className="text-lg font-semibold text-gray-900 mb-6">
-            Face Recognition Check-In
-          </h3>
+          <div className="flex items-center gap-3 mb-6">
+            {attendanceAction === "check-in" ? (
+              <CheckInIcon className="w-6 h-6 text-green-600" />
+            ) : (
+              <CheckOutIcon className="w-6 h-6 text-amber-600" />
+            )}
+            <h3 className="text-lg font-semibold text-gray-900">
+              Face Recognition{" "}
+              {attendanceAction === "check-in" ? "Check-In" : "Check-Out"}
+            </h3>
+          </div>
 
           {/* Camera View */}
           <div className="relative w-full max-w-xl aspect-video rounded-2xl bg-slate-900 shadow-lg overflow-hidden mb-6">
@@ -412,12 +462,16 @@ const Attendance: React.FC = () => {
 
           {/* Camera Controls */}
           <div className="w-full max-w-xl space-y-3">
-            {cameraMode === "inactive" && !todayAttendance && (
+            {cameraMode === "inactive" && !todayAttendance?.check_out_time && (
               <button
                 type="button"
                 onClick={startCamera}
                 disabled={!modelsLoaded}
-                className="w-full flex items-center justify-center gap-2 px-6 py-4 bg-[#28a745] hover:bg-[#218838] text-white rounded-xl font-medium transition-all shadow-lg disabled:opacity-50"
+                className={`w-full flex items-center justify-center gap-2 px-6 py-4 ${
+                  attendanceAction === "check-in"
+                    ? "bg-[#28a745] hover:bg-[#218838]"
+                    : "bg-amber-500 hover:bg-amber-600"
+                } text-white rounded-xl font-medium transition-all shadow-lg disabled:opacity-50`}
               >
                 {modelsLoaded ? (
                   <>
@@ -438,7 +492,11 @@ const Attendance: React.FC = () => {
                 type="button"
                 onClick={captureAndRecognize}
                 disabled={isProcessing || !modelsLoaded}
-                className="w-full flex items-center justify-center gap-2 px-6 py-4 bg-blue-500 hover:bg-blue-600 text-white rounded-xl font-medium transition-all shadow-lg disabled:opacity-50"
+                className={`w-full flex items-center justify-center gap-2 px-6 py-4 ${
+                  attendanceAction === "check-in"
+                    ? "bg-blue-500 hover:bg-blue-600"
+                    : "bg-orange-500 hover:bg-orange-600"
+                } text-white rounded-xl font-medium transition-all shadow-lg disabled:opacity-50`}
               >
                 {isProcessing ? (
                   <>
@@ -448,13 +506,13 @@ const Attendance: React.FC = () => {
                 ) : (
                   <>
                     <Camera className="w-5 h-5" />
-                    Capture & Check In
+                    Capture &{" "}
+                    {attendanceAction === "check-in" ? "Check In" : "Check Out"}
                   </>
                 )}
               </button>
             )}
 
-            {/* Retry button logic remains the same */}
             {resultMessage && resultMessage.type !== "success" && (
               <button
                 type="button"
@@ -467,12 +525,15 @@ const Attendance: React.FC = () => {
             )}
           </div>
 
-          {/* Instructions (No change) */}
+          {/* Instructions */}
           <div className="mt-8 w-full max-w-xl bg-blue-50 border border-blue-200 rounded-xl p-4">
             <div className="flex items-start gap-3">
               <AlertCircle className="w-5 h-5 text-blue-600 shrink-0 mt-0.5" />
               <div className="text-sm text-blue-700">
-                <strong className="font-semibold">Check-in Tips:</strong>
+                <strong className="font-semibold">
+                  {attendanceAction === "check-in" ? "Check-In" : "Check-Out"}{" "}
+                  Tips:
+                </strong>
                 <ul className="mt-2 space-y-1 list-disc list-inside">
                   <li>Face the camera directly</li>
                   <li>Ensure good lighting</li>
