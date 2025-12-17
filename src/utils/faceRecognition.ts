@@ -2,7 +2,7 @@
 import * as faceapi from '@vladmandic/face-api';
 
 // Configuration
-const MODEL_URL = '/models';
+const MODEL_URL = import.meta.env.BASE_URL + 'models';
 
 let modelsLoadedFlag = false;
 
